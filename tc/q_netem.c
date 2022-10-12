@@ -33,7 +33,9 @@ static void explain(void)
 "Usage: ... netem [ limit PACKETS ]\n" \
 "                 [ delay TIME [ JITTER [CORRELATION]]]\n" \
 "                 [ distribution {uniform|normal|pareto|paretonormal} ]\n" \
+"                 [ pattern {time|data} {loss|delay|rate|error|duplicate|reorder} <file>\n" \
 "                 [ corrupt PERCENT [CORRELATION]]\n" \
+"                 [ fwmark NUMBER ]\n" \
 "                 [ duplicate PERCENT [CORRELATION]]\n" \
 "                 [ loss random PERCENT [CORRELATION]]\n" \
 "                 [ loss state P13 [P31 [P32 [P23 P14]]]\n" \
@@ -162,6 +164,7 @@ static int netem_parse_opt(struct qdisc_util *qu, int argc, char **argv,
 {
 	int dist_size = 0;
 	int slot_dist_size = 0;
+	int pattern_size = 0;
 	struct rtattr *tail;
 	struct tc_netem_qopt opt = { .limit = 1000 };
 	struct tc_netem_corr cor = {};
@@ -173,6 +176,8 @@ static int netem_parse_opt(struct qdisc_util *qu, int argc, char **argv,
 	struct tc_netem_slot slot = {};
 	__s16 *dist_data = NULL;
 	__s16 *slot_dist_data = NULL;
+	__s16 *pattern_data = NULL;
+	__u16 pattern_type = 0;
 	__u16 loss_type = NETEM_LOSS_UNSPEC;
 	int present[__TCA_NETEM_MAX] = {};
 	__u64 rate64 = 0;
@@ -328,6 +333,55 @@ static int netem_parse_opt(struct qdisc_util *qu, int argc, char **argv,
 					*argv);
 				return -1;
 			}
+		} else if (matches(*argv, "pattern") == 0) {
+			if (pattern_type > 0 || dist_data > 0) {
+				fprintf(stderr, "You can only have one distribution or pattern at a time\n");
+				return -1;
+			}
+			NEXT_ARG();
+			if (!strcmp(*argv, "time")) {
+				pattern_type |= PTN_MODE_TIME;
+			} else if (!strcmp(*argv, "data")) {
+				pattern_type |= PTN_MODE_DATA;
+			} else {
+				fprintf(stderr, "Unknown drive more: %s\n",
+					*argv);
+				return -1;
+			}
+			NEXT_ARG();
+			if (!strcmp(*argv, "loss")) {
+				pattern_type |= PTN_EFFECT_LOSS;
+			} else if(!strcmp(*argv, "delay")) {
+				pattern_type |= PTN_EFFECT_DELAY;
+			} else if (!strcmp(*argv, "rate")) {
+				pattern_type |= PTN_EFFECT_RATE;
+			} else if (!strcmp(*argv, "error")) {
+				if (pattern_type == PTN_MODE_TIME) {
+					fprintf(stderr, "time-driven bit-errors are not supported!\n");
+					return -1;
+				}
+				pattern_type |= PTN_EFFECT_ERROR;
+			} else if (!strcmp(*argv, "duplicate")) {
+				pattern_type |= PTN_EFFECT_DUP;
+			} else if (!strcmp(*argv, "reorder")) {
+				if (pattern_type == PTN_MODE_TIME) {
+					fprintf(stderr, "time-driven reordering is not supported!\n");
+					return -1;
+				}
+				pattern_type |= PTN_EFFECT_REORDER;
+			} else {
+				fprintf(stderr, "unknown pattern type: %s\n", *argv);
+				return -1;
+			}
+			NEXT_ARG();
+			pattern_data = calloc(sizeof(pattern_data[0]),
+					      MAX_DIST);
+			pattern_size = get_distribution(*argv, pattern_data,
+							MAX_DIST);
+			if (pattern_size <= 0) {
+				free(pattern_data);
+				return -1;
+			}
 		} else if (matches(*argv, "ecn") == 0) {
 			present[TCA_NETEM_ECN] = 1;
 		} else if (matches(*argv, "reorder") == 0) {
@@ -360,6 +414,12 @@ static int netem_parse_opt(struct qdisc_util *qu, int argc, char **argv,
 					return -1;
 				}
 			}
+		} else if (matches(*argv, "fwmark") == 0) {
+			NEXT_ARG();
+			if (get_u32(&opt.fwmark, *argv, 0)) {
+				explain1("fwmark");
+				return -1;
+			}
 		} else if (matches(*argv, "gap") == 0) {
 			NEXT_ARG();
 			if (get_u32(&opt.gap, *argv, 0)) {
@@ -380,6 +440,10 @@ static int netem_parse_opt(struct qdisc_util *qu, int argc, char **argv,
 				}
 			}
 		} else if (matches(*argv, "distribution") == 0) {
+			if (pattern_type > 0) {
+				fprintf(stderr, "You can only have one distribution or pattern at a time\n");
+				return -1;
+			}
 			NEXT_ARG();
 			dist_data = calloc(sizeof(dist_data[0]), MAX_DIST);
 			dist_size = get_distribution(*argv, dist_data, MAX_DIST);
@@ -605,6 +669,21 @@ static int netem_parse_opt(struct qdisc_util *qu, int argc, char **argv,
 			return -1;
 		free(slot_dist_data);
 	}
+	
+	if (pattern_data) {
+		if (addattr_l(n, 1024, TCA_NETEM_PTYPE, &pattern_type, sizeof(pattern_type)) < 0) {
+			fprintf(stderr, "Couldn't send pattern type\n");
+			return -1;
+		}
+		if (addattr_l(n, MAX_DIST * sizeof(pattern_data[0]),
+			      TCA_NETEM_PATTERN,
+			      pattern_data, pattern_size * sizeof(pattern_data[0])) < 0) {
+			fprintf(stderr, "Couldn't send pattern data\n");
+			return -1;
+		}
+		free(pattern_data);
+	}
+	
 	tail->rta_len = (void *) NLMSG_TAIL(n) - (void *) tail;
 	return 0;
 }
